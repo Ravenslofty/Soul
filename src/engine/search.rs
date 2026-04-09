@@ -601,10 +601,23 @@ impl Worker {
         // Used as a baseline for pruning decisions — if the position looks
         // overwhelmingly good or hopeless, we can take shortcuts.
         // Meaningless when in check (we're forced to respond, not evaluate).
-        let static_eval = if in_check {
+        let raw_static_eval = if in_check {
             tt::SCORE_NONE
         } else {
             evaluate(&self.pos, &self.accumulator)
+        };
+
+        // ── Correction History ──
+        // The evaluator has systematic biases for certain pawn structures.
+        // Correction history observes the delta between static eval and search
+        // result, then nudges future evals for the same pawn structure toward
+        // the truth. raw_static_eval stays untouched for the update later.
+        let static_eval = if in_check {
+            tt::SCORE_NONE
+        } else {
+            let correction =
+                self.history.correction(self.pos.stm, self.pos.pawn_hash) / history::CORRECTION_SCALE;
+            (raw_static_eval + correction).clamp(-MATE_BOUND, MATE_BOUND)
         };
         self.stack[ply].static_eval = static_eval;
 
@@ -926,6 +939,15 @@ impl Worker {
             .tt
             .store(self.pos.hash, ply, depth, res.best_eval, res.best_move, bound);
 
+        // ── Correction History Update ──
+        // When the search result disagrees with the raw evaluator, record
+        // the bias so future evals for this pawn structure are corrected.
+        if !in_check && bound != tt::BOUND_NONE && res.best_eval.abs() < MATE_BOUND {
+            let diff = res.best_eval - raw_static_eval;
+            self.history
+                .update_correction(self.pos.stm, self.pos.pawn_hash, diff, depth);
+        }
+
         Ok(res.best_eval)
     }
 
@@ -1136,9 +1158,14 @@ impl Worker {
         let mut best_eval = if in_check {
             -INF
         } else {
-            let eval = evaluate(&self.pos, &self.accumulator);
-            if eval >= beta {
-                return Ok(eval);
+            let raw_static_eval = evaluate(&self.pos, &self.accumulator);
+            let static_eval = {
+                let correction =
+                    self.history.correction(self.pos.stm, self.pos.pawn_hash) / history::CORRECTION_SCALE;
+                (raw_static_eval + correction).clamp(-MATE_BOUND, MATE_BOUND)
+            };
+            if static_eval >= beta {
+                return Ok(static_eval);
             }
 
             // ── Delta Pruning (~20 Elo) ──
@@ -1158,12 +1185,12 @@ impl Worker {
             .into_iter()
             .find(|&pt| self.pos.pieces(pt, opp).is_not_empty())
             .map_or(0, |pt| searcher.cfg.mvvlva_v[pt as usize]);
-            if eval + best_capturable + searcher.cfg.search_params.delta_margin < alpha {
+            if static_eval + best_capturable + searcher.cfg.search_params.delta_margin < alpha {
                 return Ok(alpha);
             }
 
-            alpha = alpha.max(eval);
-            eval
+            alpha = alpha.max(static_eval);
+            static_eval
         };
 
         let mut moves_made = 0;
